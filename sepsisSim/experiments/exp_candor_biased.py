@@ -1,5 +1,5 @@
 # ## Simulation parameters
-exp_name = 'exp-FINAL-1'
+exp_name = 'exp-CANDOR-22'
 eps = 0.10
 eps_str = '0_1'
 
@@ -12,12 +12,14 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--flip_num', type=int)
 parser.add_argument('--flip_seed', type=int)
+parser.add_argument('--noise', type=float, default=0.2)
 args = parser.parse_args()
 pol_flip_num = args.flip_num
 pol_flip_seed = args.flip_seed
+annot_noise = args.noise
 
 pol_name = f'flip{pol_flip_num}_seed{pol_flip_seed}'
-out_fname = f'./results/{exp_name}/vaso_eps_{eps_str}-{pol_name}-orig.csv'
+out_fname = f'./results/{exp_name}/vaso_eps_{eps_str}-{pol_name}-candor-biased-Noise_{annot_noise}.csv'
 
 import numpy as np
 import pandas as pd
@@ -45,8 +47,9 @@ from joblib import Parallel, delayed
 from OPE_utils_new import (
     format_data_tensor,
     policy_eval_analytic_finite,
-    OPE_IS_h,
+    OPE_CANDOR_h,
     compute_behavior_policy_h,
+    compute_empirical_q_h_annot,
 )
 
 
@@ -109,8 +112,33 @@ def load_data(fname):
     return df_data
 
 
-# df_seed1 = load_data('1-features.csv') # tr
+# df_train = load_data('1-features.csv') # tr
 df_seed2 = load_data('2-features.csv') # va
+
+
+# ## Load annotations (perfect CF, to be noised)
+df_annot_all = pd.read_pickle(f'results/vaso_eps_{eps_str}-evalOpt_df_seed2_aug_step.pkl')
+print('Loaded perfect annotations:', len(df_annot_all), 'rows')
+
+
+## Default weighting scheme for CANDOR (same as original for consistency)
+
+weight_a_sa = np.zeros((nS, nA, nA))
+
+# default weight if no counterfactual actions
+for a in range(nA):
+    weight_a_sa[:, a, a] = 1
+
+# split equally between factual and counterfactual actions
+for s in range(nS):
+    a = π_star.argmax(axis=1)[s]
+    a_tilde = a+1-2*(a%2)
+    weight_a_sa[s, a, a] = 0.5
+    weight_a_sa[s, a, a_tilde] = 0.5
+    weight_a_sa[s, a_tilde, a] = 0.5
+    weight_a_sa[s, a_tilde, a_tilde] = 0.5
+
+assert np.all(weight_a_sa.sum(axis=-1) == 1)
 
 
 # ## Policies
@@ -157,7 +185,48 @@ np.savetxt(f'./results/{exp_name}/policy_{pol_name}.txt', π_flip)
 π_eval = π_flip
 
 
-# ### Baseline IS: original dataset
+# ### Proposed: replace future with the value function for the evaluation policy
+rng_annot = np.random.default_rng(seed=123456789)
+
+V_H_eval, Q_H_eval, J_eval = policy_eval_helper(π_eval)
+
+# Create biased annotations for Q fitting (vectorized)
+df_annot = df_annot_all.copy()
+df_annot['Weight'] = np.nan
+
+# Precompute a_f for CF rows (vectorized flip)
+mask_cf = df_annot['NextState'] == 1442
+if mask_cf.any():
+    a_cf = df_annot.loc[mask_cf, 'Action'].astype(int).values
+    s_cf = df_annot.loc[mask_cf, 'State'].astype(int).values
+    h_cf = df_annot.loc[mask_cf, 'Time'].astype(int).values
+
+    # Vectorized a_f = a_cf + 1 - 2*(a_cf % 2)
+    a_f = a_cf + 1 - 2 * (a_cf % 2)
+
+    # Vectorized weights using precomputed weight_a_sa (broadcast)
+    weights_cf = weight_a_sa[s_cf, a_f, a_cf]  # Shape: (num_cf,)
+    df_annot.loc[mask_cf, 'Weight'] = weights_cf
+
+    # Vectorized noise addition to Reward (handle list indexing for Q_H_eval)
+    noise = rng_annot.normal(0, annot_noise, size=len(a_cf))
+    q_values = np.array([Q_H_eval[h][s, a] for h, s, a in zip(h_cf, s_cf, a_cf)])
+    df_annot.loc[mask_cf, 'Reward'] = q_values + noise
+
+# Terminating rows
+mask_term = df_annot['NextState'].isin([1440, 1441])
+df_annot.loc[mask_term, 'Weight'] = 1.0
+
+# Fillna
+df_annot['Weight'] = df_annot['Weight'].fillna(1)
+
+
+# ## Train Q-model on biased annotated data
+print('Computing empirical Q_h and V_h from biased annotations...')
+Q_hats, V_hats = compute_empirical_q_h_annot(df_annot, π_eval, gamma, H, version='v1')
+
+
+# ### CANDOR DM+-IS (biased): on val dataset (original trajectories)
 
 df_results = []
 for run in range(runs):
@@ -166,13 +235,13 @@ for run in range(runs):
     ]
     df = df_va[['pt_id', 'Time', 'State', 'Action', 'Reward', 'NextState']]
 
-    # OPE - WIS/WDR prep
+    # OPE - CANDOR prep
     data_va = format_data_tensor(df)
     pi_b_va = compute_behavior_policy_h(df)
 
-    # OPE - IS
-    IS_value, WIS_value, ESS_info = OPE_IS_h(data_va, pi_b_va, π_eval, gamma, epsilon=0.0)
-    df_results.append([IS_value, WIS_value, ESS_info['ESS1'], ESS_info['ESS2']])
+    # OPE - CANDOR (biased)
+    CANDOR_value, info = OPE_CANDOR_h(data_va, pi_b_va, π_eval, Q_hats, V_hats, gamma, epsilon=0.0, version='v1')
+    df_results.append([CANDOR_value])
 
-df_results = pd.DataFrame(df_results, columns=['IS_value', 'WIS_value', 'ESS1', 'ESS2'])
+df_results = pd.DataFrame(df_results, columns=['CANDOR_value'])
 df_results.to_csv(out_fname, index=False)

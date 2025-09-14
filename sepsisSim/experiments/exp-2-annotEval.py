@@ -329,7 +329,7 @@ assert π_flip.sum(axis=1).mean() == 1
 
 # ### Proposed: replace future with the value function for the evaluation policy
 
-df_va_all2 = pd.read_pickle(f'results/vaso_eps_{eps_str}-annotOpt_df_seed2_aug_step.pkl')
+df_va_all2 = pd.read_pickle(f'results/vaso_eps_{eps_str}-evalOpt_df_seed2_aug_step.pkl')
 V_H_eval, Q_H_eval, J_eval = policy_eval_helper(π_eval)
 
 

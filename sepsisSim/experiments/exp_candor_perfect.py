@@ -1,5 +1,5 @@
 # ## Simulation parameters
-exp_name = 'exp-FINAL-1'
+exp_name = 'exp-CANDOR-1'
 eps = 0.10
 eps_str = '0_1'
 
@@ -7,8 +7,17 @@ run_idx_length = 1_000
 N_val = 1_000
 runs = 50
 
-pol_name = 'onpolicy'
-out_fname = f'./results/{exp_name}/vaso_eps_{eps_str}-{pol_name}-orig.csv'
+# Number of action-flipped states
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--flip_num', type=int)
+parser.add_argument('--flip_seed', type=int)
+args = parser.parse_args()
+pol_flip_num = args.flip_num
+pol_flip_seed = args.flip_seed
+
+pol_name = f'flip{pol_flip_num}_seed{pol_flip_seed}'
+out_fname = f'./results/{exp_name}/vaso_eps_{eps_str}-{pol_name}-candor-perfect.csv'
 
 import numpy as np
 import pandas as pd
@@ -36,8 +45,9 @@ from joblib import Parallel, delayed
 from OPE_utils_new import (
     format_data_tensor,
     policy_eval_analytic_finite,
-    OPE_IS_h,
+    OPE_CANDOR_h,
     compute_behavior_policy_h,
+    compute_empirical_q_h_annot,
 )
 
 
@@ -100,8 +110,14 @@ def load_data(fname):
     return df_data
 
 
-# df_seed1 = load_data('1-features.csv') # tr
+df_train = load_data('1-features.csv') # tr
 df_seed2 = load_data('2-features.csv') # va
+
+
+# ## Load annotations (perfect CF)
+annot_fname = f'./results/vaso_eps_{eps_str}-evalOpt_df_seed2_aug_step.pkl'
+df_annot = pd.read_pickle(annot_fname)
+print('Loaded annotations:', len(df_annot), 'rows')
 
 
 # ## Policies
@@ -118,13 +134,42 @@ df_seed2 = load_data('2-features.csv') # va
 π_beh[π_beh == 0.5] = eps
 
 V_H_beh, Q_H_beh, J_beh = policy_eval_helper(π_beh)
+J_beh
+
+
+# ### Optimal policy
+V_H_star, Q_H_star, J_star = policy_eval_helper(π_star)
+J_star
+
+
+# ### flip action for x% states
+
+rng_flip = np.random.default_rng(pol_flip_seed)
+flip_states = rng_flip.choice(range(1440), pol_flip_num, replace=False)
+
+π_tmp = (np.tile(π_star.reshape((-1,2,2,2)).sum(axis=3, keepdims=True), (1,1,1,2)).reshape((-1, 8)) / 2)
+π_flip = π_tmp.copy()
+π_flip[π_tmp == 0.5] = 0
+π_flip[π_star == 1] = 1
+for s in flip_states:
+    π_flip[s, π_tmp[s] == 0.5] = 1
+    π_flip[s, π_star[s] == 1] = 0
+assert π_flip.sum(axis=1).mean() == 1
+
+np.savetxt(f'./results/{exp_name}/policy_{pol_name}.txt', π_flip)
+
+
+# ## Train Q-model on annotated data (perfect CF)
+print('Computing empirical Q_h and V_h from perfect annotations...')
+Q_hats, V_hats = compute_empirical_q_h_annot(df_annot, π_flip, gamma, H, version='v1')
+
 
 # ## Compare OPE
 
-π_eval = π_beh
+π_eval = π_flip
 
 
-# ### Baseline IS: original dataset
+# ### CANDOR DM+-IS: on val dataset (original trajectories)
 
 df_results = []
 for run in range(runs):
@@ -133,13 +178,13 @@ for run in range(runs):
     ]
     df = df_va[['pt_id', 'Time', 'State', 'Action', 'Reward', 'NextState']]
 
-    # OPE - WIS/WDR prep
+    # OPE - CANDOR prep
     data_va = format_data_tensor(df)
     pi_b_va = compute_behavior_policy_h(df)
 
-    # OPE - IS
-    IS_value, WIS_value, ESS_info = OPE_IS_h(data_va, pi_b_va, π_eval, gamma, epsilon=0.0)
-    df_results.append([IS_value, WIS_value, ESS_info['ESS1'], ESS_info['ESS2']])
+    # OPE - CANDOR
+    CANDOR_value, info = OPE_CANDOR_h(data_va, pi_b_va, π_eval, Q_hats, V_hats, gamma, epsilon=0.0, version='v1')
+    df_results.append([CANDOR_value])
 
-df_results = pd.DataFrame(df_results, columns=['IS_value', 'WIS_value', 'ESS1', 'ESS2'])
+df_results = pd.DataFrame(df_results, columns=['CANDOR_value'])
 df_results.to_csv(out_fname, index=False)

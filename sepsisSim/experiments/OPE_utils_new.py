@@ -175,3 +175,225 @@ def _is_h(data, π_b, π_e, γ):
         'ESS1': ess1, 'ESS2': ess2, 'G': G,
         'rho': rho, 'rho_norm': rho_norm
     }
+
+
+## DR:
+def compute_empirical_q_h(df_data, pi_e, gamma, H):
+    """
+    Compute empirical Q_h and V_h using backward pass fitted Q-evaluation (non-parametric).
+    - df_data: pd.DataFrame with columns ['Time', 'State', 'Action', 'Reward', 'NextState']
+    - pi_e: evaluation policy, shape (nS, nA)
+    - Returns: Q_hats list[H] of (nS, nA), V_hats list[H] of (nS,)
+    """
+    Q_hats = [np.zeros((nS, nA)) for _ in range(H)]
+    V_hats = [np.zeros(nS) for _ in range(H)]
+    V_next = np.zeros(nS)  # V_H = 0
+
+    for h in range(H - 1, -1, -1):
+        df_h = df_data[df_data['Time'] == h].copy()
+        if len(df_h) == 0:
+            V_hats[h] = np.zeros(nS)
+            V_next = V_hats[h].copy()
+            continue
+
+        # Vectorize v_next with mask to avoid invalid indexing
+        mask_invalid = (df_h['NextState'] < 0) | (df_h['NextState'] >= nS)
+        df_h['v_next'] = 0.0
+        valid_mask = ~mask_invalid
+        if valid_mask.any():
+            valid_next = df_h.loc[valid_mask, 'NextState'].values
+            df_h.loc[valid_mask, 'v_next'] = V_next[valid_next] * gamma
+
+        # Group by State, Action (only for a >= 0)
+        df_h_valid = df_h[df_h['Action'] >= 0]
+        if len(df_h_valid) == 0:
+            V_hats[h] = np.zeros(nS)
+            V_next = V_hats[h].copy()
+            continue
+
+        grouped = df_h_valid.groupby(['State', 'Action'])
+        for (s, a), group in grouped:
+            if len(group) == 0:
+                continue
+            mean_r = group['Reward'].mean()
+            mean_v_next = group['v_next'].mean()
+            Q_hats[h][s, a] = mean_r + mean_v_next
+
+        # Compute V_h(s) = sum_a pi_e(s, a) * Q_h(s, a)
+        for s in range(nS):
+            V_hats[h][s] = np.sum(pi_e[s] * Q_hats[h][s])
+
+        V_next = V_hats[h].copy()
+
+    return Q_hats, V_hats
+
+def compute_empirical_q_h_annot(df_annot, pi_e, gamma, H, version='v1'):
+    """
+    Compute empirical Q_h and V_h using annotated data for CANDOR DM+-IS.
+    - df_annot: pd.DataFrame with columns ['Time', 'State', 'Action', 'Reward', 'NextState']
+        Augmented with counterfactual transitions (Action = a_alt, Reward adjusted to Q(s,a_alt))
+    - version: 'v1' for initial flip, 'v2' for all steps
+    - Fits Q using all transitions (original + annotated)
+    """
+    Q_hats = [np.zeros((nS, nA)) for _ in range(H)]
+    V_hats = [np.zeros(nS) for _ in range(H)]
+    V_next = np.zeros(nS)  # V_H = 0
+
+    for h in range(H - 1, -1, -1):
+        # Filter transitions at time h (valid actions)
+        df_h = df_annot[(df_annot['Time'] == h) & (df_annot['Action'] >= 0)].copy()
+        if len(df_h) == 0:
+            V_hats[h] = np.zeros(nS)
+            V_next = V_hats[h].copy()
+            continue
+
+        # Vectorize v_next with mask to avoid invalid indexing
+        mask_invalid = (df_h['NextState'] < 0) | (df_h['NextState'] >= nS)
+        df_h['v_next'] = 0.0
+        valid_mask = ~mask_invalid
+        if valid_mask.any():
+            valid_next = df_h.loc[valid_mask, 'NextState'].values
+            df_h.loc[valid_mask, 'v_next'] = V_next[valid_next] * gamma
+
+        # Group by State, Action
+        grouped = df_h.groupby(['State', 'Action'])
+        counts = {}  # To average properly
+        for (s, a), group in grouped:
+            if len(group) == 0:
+                continue
+            mean_r = group['Reward'].mean()
+            mean_v_next = group['v_next'].mean()
+            Q_hats[h][s, a] = mean_r + mean_v_next
+            counts[(s, a)] = len(group)
+
+        # Compute V_h(s) = sum_a pi_e(s, a) * Q_h(s, a)
+        for s in range(nS):
+            V_hats[h][s] = np.sum(pi_e[s] * Q_hats[h][s])
+
+        V_next = V_hats[h].copy()
+
+    return Q_hats, V_hats
+
+def _dr_h(data, pi_b, pi_e, Q_hats, V_hats, gamma):
+    """
+    Doubly Robust for Off-Policy Evaluation (trajectory-level)
+    - data: tensor (N, T, 5) [t, s, a, r, s']
+    - pi_b: (H, nS, nA)
+    - pi_e: (nS, nA)
+    - Q_hats, V_hats: lists of length H
+    - Returns: dr_value, info dict with 'dr_returns'
+    """
+    t_list = data[..., 0].astype(int)
+    s_list = data[..., 1].astype(int)
+    a_list = data[..., 2].astype(int)
+    r_list = data[..., 3].astype(float)
+    sp_list = data[..., 4].astype(int)
+
+    N, T = data.shape[:2]
+    dr_returns = np.zeros(N)
+
+    for i in range(N):
+        traj_dr = 0.0
+        cum_rho = 1.0
+        for tt in range(T):
+            t = int(t_list[i, tt])
+            if t >= H:
+                break
+            s = int(s_list[i, tt])
+            a = int(a_list[i, tt])
+            r = r_list[i, tt]
+            sp = int(sp_list[i, tt])
+
+            if a == -1:
+                rho_t = 1.0
+                q_sa = 0.0
+                v_sp = 0.0
+            else:
+                p_b_t = pi_b[t, s, a]
+                if p_b_t == 0:
+                    rho_t = 0.0  # or handle, but assume >0
+                else:
+                    rho_t = pi_e[s, a] / p_b_t
+                q_sa = Q_hats[t][s, a]
+                v_sp = 0.0 if (sp < 0 or sp >= nS) else (V_hats[t + 1][sp] if t + 1 < H else 0.0)
+
+            delta = r + gamma * v_sp - q_sa
+            v_s = V_hats[t][s]
+            contrib = v_s + cum_rho * rho_t * delta
+            traj_dr += (gamma ** t) * contrib
+            cum_rho *= rho_t
+
+        dr_returns[i] = traj_dr
+
+    dr_value = np.mean(dr_returns)
+    return dr_value, {
+        'dr_returns': dr_returns
+    }
+
+def _candor_dm_is_h(data, pi_b, pi_e, Q_hats, V_hats, gamma):
+    """
+    CANDOR DM+-IS: Doubly Robust with augmented DM from annotations (trajectory-level)
+    - Similar to _dr_h, but Q_hats/V_hats from annotated data
+    """
+    t_list = data[..., 0].astype(int)
+    s_list = data[..., 1].astype(int)
+    a_list = data[..., 2].astype(int)
+    r_list = data[..., 3].astype(float)
+    sp_list = data[..., 4].astype(int)
+
+    N, T = data.shape[:2]
+    candor_returns = np.zeros(N)
+
+    for i in range(N):
+        traj_candor = 0.0
+        cum_rho = 1.0
+        for tt in range(T):
+            t = int(t_list[i, tt])
+            if t >= H:
+                break
+            s = int(s_list[i, tt])
+            a = int(a_list[i, tt])
+            r = r_list[i, tt]
+            sp = int(sp_list[i, tt])
+
+            if a == -1:
+                rho_t = 1.0
+                q_sa = 0.0
+                v_sp = 0.0
+            else:
+                p_b_t = pi_b[t, s, a]
+                if p_b_t == 0:
+                    rho_t = 0.0
+                else:
+                    rho_t = pi_e[s, a] / p_b_t
+                q_sa = Q_hats[t][s, a]
+                v_sp = 0.0 if (sp < 0 or sp >= nS) else (V_hats[t + 1][sp] if t + 1 < H else 0.0)
+
+            delta = r + gamma * v_sp - q_sa
+            v_s = V_hats[t][s]
+            contrib = v_s + cum_rho * rho_t * delta
+            traj_candor += (gamma ** t) * contrib
+            cum_rho *= rho_t
+
+        candor_returns[i] = traj_candor
+
+    candor_value = np.mean(candor_returns)
+    return candor_value, {
+        'candor_returns': candor_returns
+    }
+
+def OPE_DR_h(data, pi_b, pi_e, Q_hats, V_hats, gamma, epsilon=0.0):
+    """
+    Doubly Robust Off-Policy Evaluation
+    - Similar to OPE_IS_h, but uses Q_hats and V_hats
+    - epsilon: not used for DR, kept for consistency
+    """
+    return _dr_h(data, pi_b, pi_e, Q_hats, V_hats, gamma)
+
+def OPE_CANDOR_h(data, pi_b, pi_e, Q_hats, V_hats, gamma, epsilon=0.0, version='v1'):
+    """
+    CANDOR DM+-IS Off-Policy Evaluation
+    - Uses annotated Q_hats/V_hats in DR framework
+    - version: passed to compute_empirical_q_h_annot if needed, but here assumed precomputed
+    """
+    return _candor_dm_is_h(data, pi_b, pi_e, Q_hats, V_hats, gamma)

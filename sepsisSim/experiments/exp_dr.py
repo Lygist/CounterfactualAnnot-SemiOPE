@@ -1,5 +1,5 @@
 # ## Simulation parameters
-exp_name = 'exp-FINAL-1'
+exp_name = 'exp-DR-1'
 eps = 0.10
 eps_str = '0_1'
 
@@ -7,31 +7,47 @@ run_idx_length = 1_000
 N_val = 1_000
 runs = 50
 
+# Number of action-flipped states
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--flip_num', type=int)
+parser.add_argument('--flip_seed', type=int)
+args = parser.parse_args()
+pol_flip_num = args.flip_num
+pol_flip_seed = args.flip_seed
 
-out_fname = f'./results/{exp_name}/vaso_eps_{eps_str}-observed.csv'
+pol_name = f'flip{pol_flip_num}_seed{pol_flip_seed}'
+out_fname = f'./results/{exp_name}/vaso_eps_{eps_str}-{pol_name}-dr.csv'
 
 import numpy as np
 import pandas as pd
+
+df_tmp = None
+try:
+    df_tmp = pd.read_csv(out_fname)
+except:
+    pass
+
+if df_tmp is not None:
+    print('File exists')
+    quit()
+
 from tqdm import tqdm
 from collections import defaultdict
 import pickle
 import itertools
 import copy
 import random
-import matplotlib.pyplot as plt
-import seaborn as sns
-import scipy.stats
-from sklearn import metrics
 import itertools
-
 import joblib
 from joblib import Parallel, delayed
 
 from OPE_utils_new import (
     format_data_tensor,
     policy_eval_analytic_finite,
-    OPE_IS_h,
+    OPE_DR_h,
     compute_behavior_policy_h,
+    compute_empirical_q_h,
 )
 
 
@@ -93,7 +109,8 @@ def load_data(fname):
     print('DONE')
     return df_data
 
-# df_seed1 = load_data('1-features.csv') # tr
+
+df_train = load_data('1-features.csv') # tr
 df_seed2 = load_data('2-features.csv') # va
 
 
@@ -119,25 +136,49 @@ V_H_star, Q_H_star, J_star = policy_eval_helper(π_star)
 J_star
 
 
+# ### flip action for x% states
+
+rng_flip = np.random.default_rng(pol_flip_seed)
+flip_states = rng_flip.choice(range(1440), pol_flip_num, replace=False)
+
+π_tmp = (np.tile(π_star.reshape((-1,2,2,2)).sum(axis=3, keepdims=True), (1,1,1,2)).reshape((-1, 8)) / 2)
+π_flip = π_tmp.copy()
+π_flip[π_tmp == 0.5] = 0
+π_flip[π_star == 1] = 1
+for s in flip_states:
+    π_flip[s, π_tmp[s] == 0.5] = 1
+    π_flip[s, π_star[s] == 1] = 0
+assert π_flip.sum(axis=1).mean() == 1
+
+np.savetxt(f'./results/{exp_name}/policy_{pol_name}.txt', π_flip)
+
+
+# ## Train Q-model on train data
+print('Computing empirical Q_h and V_h...')
+Q_hats, V_hats = compute_empirical_q_h(df_train, π_flip, gamma, H)
+
 
 # ## Compare OPE
 
-# ### observed behavior
+π_eval = π_flip
 
-df_results_0 = []
+
+# ### DR: on val dataset
+
+df_results = []
 for run in range(runs):
     df_va = df_seed2.set_index('pt_id').loc[200000+run*run_idx_length:200000+run*run_idx_length + N_val - 1].reset_index()[
         ['pt_id', 'Time', 'State', 'Action', 'Reward', 'NextState']
     ]
     df = df_va[['pt_id', 'Time', 'State', 'Action', 'Reward', 'NextState']]
 
-    # OPE - WIS/WDR prep
+    # OPE - DR prep
     data_va = format_data_tensor(df)
     pi_b_va = compute_behavior_policy_h(df)
 
-    # OPE - IS
-    IS_value, WIS_value, info = OPE_IS_h(data_va, pi_b_va, π_star, gamma, epsilon=0.0)
-    df_results_0.append([info['G'].mean()])
+    # OPE - DR
+    DR_value, info = OPE_DR_h(data_va, pi_b_va, π_eval, Q_hats, V_hats, gamma, epsilon=0.0)
+    df_results.append([DR_value])
 
-df_results_0 = pd.DataFrame(df_results_0, columns=['IS_value'])
-df_results_0.to_csv(out_fname, index=False)
+df_results = pd.DataFrame(df_results, columns=['DR_value'])
+df_results.to_csv(out_fname, index=False)
